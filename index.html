@@ -24,6 +24,20 @@ button {
   margin: 5px;
   width: 150px;
 }
+.spinner {
+  border: 4px solid #f3f3f3;
+  border-top: 4px solid #3498db;
+  border-radius: 50%;
+  width: 20px;
+  height: 20px;
+  animation: spin 2s linear infinite;
+  display: inline-block;
+  margin-left: 10px;
+}
+@keyframes spin {
+  0% { transform: rotate(0deg); }
+  100% { transform: rotate(360deg); }
+}
 @media (max-width: 768px) {
   .video-container {
     flex-direction: column;
@@ -48,10 +62,11 @@ button {
     </div>
     <br />
     <div id="status" style="margin: 10px; font-weight: bold; text-align: center;">Status: Idle</div>
+    <div id="spinner" style="display: none; text-align: center;"><div class="spinner"></div></div>
     <button id="startBtn" onclick="start()" type="button" class="btn btn-success btn-lg">Start</button>
     <button id="nextBtn" onclick="next()" type="button" class="btn btn-primary btn-lg" disabled>Next</button>
     <button id="endBtn" onclick="end()" type="button" class="btn btn-warning btn-lg" disabled>End</button>
-    <button id="disconnectBtn" onclick="disconnect()" type="button" class="btn btn-danger btn-lg">Disconnect</button>
+    <button id="reportBtn" onclick="report()" type="button" class="btn btn-warning btn-lg" disabled>Report</button>
     <script src="https://www.gstatic.com/firebasejs/4.9.0/firebase.js"></script>
     <script>
         //Create an account on Firebase, and use the credentials they give you in place of the following
@@ -71,10 +86,12 @@ var pairRef = firebase.database().ref('pairs');
 var yourVideo = document.getElementById("yourVideo");
 var friendsVideo = document.getElementById("friendsVideo");
 var statusDiv = document.getElementById("status");
+var spinnerDiv = document.getElementById("spinner");
 var startBtn = document.getElementById("startBtn");
 var nextBtn = document.getElementById("nextBtn");
 var endBtn = document.getElementById("endBtn");
 var disconnectBtn = document.getElementById("disconnectBtn");
+var reportBtn = document.getElementById("reportBtn");
 var yourId = Math.floor(Math.random()*1000000000);
 var currentPairId = null;
 var pc = null;
@@ -82,8 +99,7 @@ var localStream = null;
 var isConnected = false;
 var isWaiting = false;
 var queueListenerAttached = false;
-var signalListenerAttached = false;
-var pairingTimeout = null;
+var lastStartTime = 0;
 //Create an account on Viagenie (http://numb.viagenie.ca/), and replace {'urls': 'turn:numb.viagenie.ca','credential': 'websitebeaver','username': 'websitebeaver@email.com'} with the information from your account
 var servers = {'iceServers': [
   {'urls': 'stun:stun.services.mozilla.com'},
@@ -93,8 +109,9 @@ var servers = {'iceServers': [
   {'urls': 'turn:turn.anyfirewall.com:443?transport=tcp', 'credential': 'webrtc', 'username': 'webrtc'}
 ]};
 
-function updateStatus(message) {
+function updateStatus(message, showSpinner = false) {
   statusDiv.textContent = "Status: " + message;
+  spinnerDiv.style.display = showSpinner ? 'block' : 'none';
 }
 
 function updateButtons() {
@@ -102,65 +119,80 @@ function updateButtons() {
   nextBtn.disabled = !isConnected;
   endBtn.disabled = !isConnected;
   disconnectBtn.disabled = false;
-}
-
-function updateButtons() {
-  startBtn.disabled = isWaiting || isConnected;
-  nextBtn.disabled = !isConnected;
-  endBtn.disabled = !isConnected;
-  disconnectBtn.disabled = false;
+  reportBtn.disabled = !isConnected;
 }
 
 function start() {
   if (isWaiting || isConnected) return;
-  updateStatus("Requesting camera/microphone access...");
-  navigator.mediaDevices.getUserMedia({audio:true, video:true})
-    .then(stream => {
-      localStream = stream;
-      yourVideo.srcObject = stream;
-      pc = new RTCPeerConnection(servers);
-      pc.onconnectionstatechange = () => {
-        console.log('Connection state:', pc.connectionState);
-        if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
-          updateStatus("Connection failed. Try again.");
-          end();
-        } else if (pc.connectionState === 'connected') {
-          updateStatus("Connected");
-        }
-      };
-      localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
-      pc.onicecandidate = (event => event.candidate ? sendMessage(JSON.stringify({'ice': event.candidate})) : console.log("Sent All Ice"));
-      pc.ontrack = (event) => {
-        friendsVideo.srcObject = event.streams[0];
-        isConnected = true;
+  var now = Date.now();
+  if (now - lastStartTime < 5000) {
+    updateStatus("Please wait before starting again.", false);
+    return;
+  }
+  lastStartTime = now;
+  // Check queue size first
+  queueRef.once('value', (snapshot) => {
+    if (snapshot.numChildren() >= 100) {
+      updateStatus("Queue is full. Try again later.", false);
+      return;
+    }
+    updateStatus("Requesting camera/microphone access...", true);
+    navigator.mediaDevices.getUserMedia({audio:true, video:true})
+      .then(stream => {
+        localStream = stream;
+        yourVideo.srcObject = stream;
+        pc = new RTCPeerConnection(servers);
+        pc.onconnectionstatechange = () => {
+          console.log('Connection state:', pc.connectionState);
+          if (pc.connectionState === 'failed') {
+            updateStatus("Connection failed. Attempting to reconnect...", true);
+            if (pc.restartIce) pc.restartIce();
+            setTimeout(() => {
+              if (pc.connectionState !== 'connected') {
+                updateStatus("Reconnection failed. Click Next for new partner.", false);
+                setTimeout(() => { if (isConnected) end(); }, 5000);
+              }
+            }, 10000);
+          } else if (pc.connectionState === 'disconnected') {
+            updateStatus("Connection lost. Attempting to reconnect...", true);
+            if (pc.restartIce) pc.restartIce();
+          } else if (pc.connectionState === 'connected') {
+            updateStatus("Connected", false);
+          }
+        };
+        localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+        pc.onicecandidate = (event => event.candidate ? sendMessage(JSON.stringify({'ice': event.candidate})) : console.log("Sent All Ice"));
+        pc.ontrack = (event) => {
+          friendsVideo.srcObject = event.streams[0];
+          isConnected = true;
+          updateButtons();
+          updateStatus("Connected", false);
+        };
+        isWaiting = true;
         updateButtons();
-        updateStatus("Connected");
-      };
-      isWaiting = true;
-      updateButtons();
-      updateStatus("Searching for pair...");
-      // Add to queue with onDisconnect
-      var queueItem = queueRef.push();
-      queueItem.set({id: yourId, timestamp: Date.now()});
-      queueItem.onDisconnect().remove();
-      // Attach queue listener if not already
-      if (!queueListenerAttached) {
-        queueRef.on('value', handleQueue);
-        queueListenerAttached = true;
-      }
-      // Set timeout for no pair
-      pairingTimeout = setTimeout(() => {
-        if (isWaiting) {
-          updateStatus("No pair found. Try again.");
-          end();
+        updateStatus("Searching for pair...", true);
+        // Add to queue with onDisconnect
+        var queueItem = queueRef.push();
+        queueItem.set({id: yourId, timestamp: Date.now()});
+        queueItem.onDisconnect().remove();
+        // Attach queue listener if not already
+        if (!queueListenerAttached) {
+          queueRef.on('value', handleQueue);
+          queueListenerAttached = true;
         }
-      }, 30000);
-    })
-    .catch(error => {
-      console.error('Error accessing media devices.', error);
-      updateStatus("Error accessing camera/microphone. Check permissions.");
-    });
-}
+        // Set timeout for no pair
+        pairingTimeout = setTimeout(() => {
+          if (isWaiting) {
+            updateStatus("No pair found. Click Start to try again.", false);
+            end();
+          }
+        }, 30000);
+      })
+      .catch(error => {
+        console.error('Error accessing media devices.', error);
+        updateStatus("Error accessing camera/microphone. Check permissions.", false);
+      });
+  });
 
 function handleQueue(snapshot) {
   if (!isWaiting || currentPairId) return;
@@ -186,8 +218,10 @@ function handleQueue(snapshot) {
         if (committed) {
           currentPairId = data1.id < data2.id ? data1.id + '_' + data2.id : data2.id + '_' + data1.id;
           pairRef.child(currentPairId).set({user1: data1.id, user2: data2.id, timestamp: Date.now()});
+          pairRef.child(currentPairId).onDisconnect().remove();
+          signalsRef.child(currentPairId).onDisconnect().remove();
           clearTimeout(pairingTimeout);
-          updateStatus("Paired! Connecting...");
+          updateStatus("Paired! Connecting...", true);
           startSignaling();
         }
       });
@@ -209,7 +243,7 @@ function startSignaling() {
       .then(() => sendMessage(JSON.stringify({'sdp': pc.localDescription})))
       .catch(error => {
         console.error('Error creating offer:', error);
-        updateStatus("Error establishing connection.");
+        updateStatus("Error establishing connection.", false);
         end();
       });
   }
@@ -235,14 +269,14 @@ function readMessage(data) {
         .then(() => sendMessage(JSON.stringify({'sdp': pc.localDescription})))
         .catch(error => {
           console.error('Error handling offer:', error);
-          updateStatus("Error establishing connection.");
+          updateStatus("Error establishing connection.", false);
           end();
         });
     } else if (msg.sdp.type == "answer") {
       pc.setRemoteDescription(new RTCSessionDescription(msg.sdp))
         .catch(error => {
           console.error('Error setting remote description:', error);
-          updateStatus("Error establishing connection.");
+          updateStatus("Error establishing connection.", false);
           end();
         });
     }
@@ -267,7 +301,7 @@ function next() {
     // Delete signals
     signalsRef.child(oldPairId).remove();
   }
-  updateStatus("Pair ended. Searching for new pair...");
+  updateStatus("Pair ended. Searching for new pair...", true);
   // Re-enter queue
   start();
 }
@@ -295,7 +329,7 @@ function end() {
   }
   isWaiting = false;
   updateButtons();
-  updateStatus("Pair ended");
+  updateStatus("Pair ended", false);
 }
 
 function disconnect() {
@@ -331,7 +365,19 @@ function disconnect() {
     });
   });
   updateButtons();
-  updateStatus("Disconnected");
+  updateStatus("Disconnected", false);
+}
+
+function report() {
+  if (!isConnected || !currentPairId) return;
+  var reportsRef = firebase.database().ref('reports');
+  reportsRef.push({
+    reporter: yourId,
+    pairId: currentPairId,
+    timestamp: Date.now(),
+    reason: 'Reported by user'
+  });
+  updateStatus("Report submitted. Thank you.", false);
 }
     </script>
   </body>
