@@ -1,24 +1,53 @@
+
+
 <html>
   <head>
     <link href="https://cdnjs.cloudflare.com/ajax/libs/twitter-bootstrap/3.3.7/css/bootstrap.min.css" rel="stylesheet">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta charset="UTF-8">
+
     <style>
-        video {
+        .video-container {
+  display: flex;
+  justify-content: space-around;
+  flex-wrap: wrap;
+}
+video {
   background-color: #ddd;
   border-radius: 7px;
-  margin: 10px 0px 0px 10px;
+  margin: 10px;
   width: 320px;
   height: 240px;
+  max-width: 45%;
 }
 button {
-  margin: 5px 5px 0px 10px !important;
+  margin: 5px;
   width: 150px;
+}
+@media (max-width: 768px) {
+  .video-container {
+    flex-direction: column;
+    align-items: center;
+  }
+  video {
+    width: 90%;
+    max-width: none;
+    height: auto;
+  }
+  button {
+    width: 90%;
+    margin: 5px auto;
+  }
 }
     </style>
   </head>
   <body>
-    <video id="yourVideo" autoplay muted playsinline></video>
-    <video id="friendsVideo" autoplay playsinline></video>
+    <div class="video-container">
+      <video id="yourVideo" autoplay muted playsinline></video>
+      <video id="friendsVideo" autoplay playsinline></video>
+    </div>
     <br />
+    <div id="status" style="margin: 10px; font-weight: bold; text-align: center;">Status: Idle</div>
     <button id="startBtn" onclick="start()" type="button" class="btn btn-success btn-lg">Start</button>
     <button id="nextBtn" onclick="next()" type="button" class="btn btn-primary btn-lg" disabled>Next</button>
     <button id="endBtn" onclick="end()" type="button" class="btn btn-warning btn-lg" disabled>End</button>
@@ -41,6 +70,7 @@ var signalsRef = firebase.database().ref('signals');
 var pairRef = firebase.database().ref('pairs');
 var yourVideo = document.getElementById("yourVideo");
 var friendsVideo = document.getElementById("friendsVideo");
+var statusDiv = document.getElementById("status");
 var startBtn = document.getElementById("startBtn");
 var nextBtn = document.getElementById("nextBtn");
 var endBtn = document.getElementById("endBtn");
@@ -53,6 +83,10 @@ var isConnected = false;
 var isWaiting = false;
 //Create an account on Viagenie (http://numb.viagenie.ca/), and replace {'urls': 'turn:numb.viagenie.ca','credential': 'websitebeaver','username': 'websitebeaver@email.com'} with the information from your account
 var servers = {'iceServers': [{'urls': 'stun:stun.services.mozilla.com'}, {'urls': 'stun:stun.l.google.com:19302'}, {'urls': 'turn:numb.viagenie.ca','credential': 'beaver','username': 'webrtc.websitebeaver@gmail.com'}]};
+
+function updateStatus(message) {
+  statusDiv.textContent = "Status: " + message;
+}
 
 function updateButtons() {
   startBtn.disabled = isWaiting || isConnected;
@@ -74,9 +108,11 @@ function start() {
         friendsVideo.srcObject = event.streams[0];
         isConnected = true;
         updateButtons();
+        updateStatus("Connected");
       };
       isWaiting = true;
       updateButtons();
+      updateStatus("Searching for pair...");
       // Add to queue
       var queueItem = queueRef.push();
       queueItem.set(yourId);
@@ -88,7 +124,7 @@ function start() {
 
 function handleQueue(snapshot) {
   var queue = snapshot.val();
-  if (!queue || !isWaiting) return;
+  if (!queue || !isWaiting || currentPairId) return;
   var keys = Object.keys(queue);
   if (keys.length >= 2) {
     var key1 = keys[0];
@@ -100,6 +136,9 @@ function handleQueue(snapshot) {
       pairRef.child(currentPairId).set({user1: id1, user2: id2});
       queueRef.child(key1).remove();
       queueRef.child(key2).remove();
+      // Stop listening to queue
+      queueRef.off('value', handleQueue);
+      updateStatus("Paired! Connecting...");
       // Start signaling
       startSignaling();
     }
@@ -149,6 +188,7 @@ function next() {
   isConnected = false;
   currentPairId = null;
   if (oldPairId) signalsRef.child(oldPairId).off('child_added', readMessage);
+  updateStatus("Pair ended. Searching for new pair...");
   // Re-enter queue
   start();
 }
@@ -162,8 +202,11 @@ function end() {
   isConnected = false;
   currentPairId = null;
   if (oldPairId) signalsRef.child(oldPairId).off('child_added', readMessage);
+  // Stop listening to queue
+  queueRef.off('value', handleQueue);
   isWaiting = false;
   updateButtons();
+  updateStatus("Pair ended");
 }
 
 function disconnect() {
@@ -182,6 +225,8 @@ function disconnect() {
   var oldPairId = currentPairId;
   currentPairId = null;
   if (oldPairId) signalsRef.child(oldPairId).off('child_added', readMessage);
+  // Stop listening to queue
+  queueRef.off('value', handleQueue);
   // Remove from queue
   queueRef.once('value', (snapshot) => {
     snapshot.forEach(child => {
@@ -189,6 +234,7 @@ function disconnect() {
     });
   });
   updateButtons();
+  updateStatus("Disconnected");
 }
     </script>
   </body>
