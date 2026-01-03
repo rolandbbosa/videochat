@@ -40,7 +40,7 @@ class RandomVideoChat {
 
         this.peerConnection.onicecandidate = (event) => {
             if (event.candidate) {
-                this.sendMessage({ type: 'candidate', candidate: event.candidate });
+                this.sendMessage('candidate', event.candidate);
             }
         };
 
@@ -77,11 +77,11 @@ class RandomVideoChat {
 
     findPartner() {
         const waitingRef = database.ref('waiting');
-        waitingRef.push({ userId: this.userId, timestamp: Date.now() });
+        waitingRef.child(this.userId).set({ timestamp: Date.now() });
 
         waitingRef.on('value', (snapshot) => {
             const waitingUsers = snapshot.val();
-            if (!waitingUsers) return;
+            if (!waitingUsers || !waitingUsers[this.userId]) return;
 
             const userIds = Object.keys(waitingUsers);
             if (userIds.length >= 2) {
@@ -94,6 +94,7 @@ class RandomVideoChat {
                     // Remove from waiting
                     waitingRef.child(this.userId).remove();
                     waitingRef.child(otherUserId).remove();
+                    waitingRef.off('value');
 
                     this.startSignaling();
                 }
@@ -108,21 +109,29 @@ class RandomVideoChat {
     startSignaling() {
         const roomRef = database.ref('rooms/' + this.currentRoom);
 
-        roomRef.on('value', (snapshot) => {
-            const data = snapshot.val();
-            if (!data) return;
-
-            if (data.type === 'offer' && !this.isInitiator) {
-                this.handleOffer(data);
-            } else if (data.type === 'answer' && this.isInitiator) {
-                this.handleAnswer(data);
-            } else if (data.type === 'candidate') {
-                this.handleCandidate(data);
-            }
-        });
-
         if (this.isInitiator) {
+            roomRef.child('answer').on('value', (snap) => {
+                const answer = snap.val();
+                if (answer) {
+                    this.handleAnswer({ answer });
+                }
+            });
+            roomRef.child('candidates').on('child_added', (snap) => {
+                const candidate = snap.val();
+                this.handleCandidate({ candidate });
+            });
             this.createOffer();
+        } else {
+            roomRef.child('offer').on('value', (snap) => {
+                const offer = snap.val();
+                if (offer) {
+                    this.handleOffer({ offer });
+                }
+            });
+            roomRef.child('candidates').on('child_added', (snap) => {
+                const candidate = snap.val();
+                this.handleCandidate({ candidate });
+            });
         }
     }
 
@@ -130,7 +139,7 @@ class RandomVideoChat {
         try {
             const offer = await this.peerConnection.createOffer();
             await this.peerConnection.setLocalDescription(offer);
-            this.sendMessage({ type: 'offer', offer: offer });
+            this.sendMessage('offer', offer);
         } catch (error) {
             console.error('Error creating offer:', error);
         }
@@ -141,7 +150,7 @@ class RandomVideoChat {
             await this.peerConnection.setRemoteDescription(new RTCSessionDescription(data.offer));
             const answer = await this.peerConnection.createAnswer();
             await this.peerConnection.setLocalDescription(answer);
-            this.sendMessage({ type: 'answer', answer: answer });
+            this.sendMessage('answer', answer);
         } catch (error) {
             console.error('Error handling offer:', error);
         }
@@ -163,8 +172,13 @@ class RandomVideoChat {
         }
     }
 
-    sendMessage(message) {
-        database.ref('rooms/' + this.currentRoom).set(message);
+    sendMessage(type, data) {
+        const roomRef = database.ref('rooms/' + this.currentRoom);
+        if (type === 'candidate') {
+            roomRef.child('candidates').push(data);
+        } else {
+            roomRef.child(type).set(data);
+        }
     }
 
     nextChat() {
