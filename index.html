@@ -81,8 +81,17 @@ var pc = null;
 var localStream = null;
 var isConnected = false;
 var isWaiting = false;
+var queueListenerAttached = false;
+var signalListenerAttached = false;
+var pairingTimeout = null;
 //Create an account on Viagenie (http://numb.viagenie.ca/), and replace {'urls': 'turn:numb.viagenie.ca','credential': 'websitebeaver','username': 'websitebeaver@email.com'} with the information from your account
-var servers = {'iceServers': [{'urls': 'stun:stun.services.mozilla.com'}, {'urls': 'stun:stun.l.google.com:19302'}, {'urls': 'turn:numb.viagenie.ca','credential': 'beaver','username': 'webrtc.websitebeaver@gmail.com'}]};
+var servers = {'iceServers': [
+  {'urls': 'stun:stun.services.mozilla.com'},
+  {'urls': 'stun:stun.l.google.com:19302'},
+  {'urls': 'turn:numb.viagenie.ca','credential': 'beaver','username': 'webrtc.websitebeaver@gmail.com'},
+  {'urls': 'turn:turn.bistri.com:80', 'credential': 'homeo', 'username': 'homeo'},
+  {'urls': 'turn:turn.anyfirewall.com:443?transport=tcp', 'credential': 'webrtc', 'username': 'webrtc'}
+]};
 
 function updateStatus(message) {
   statusDiv.textContent = "Status: " + message;
@@ -95,13 +104,30 @@ function updateButtons() {
   disconnectBtn.disabled = false;
 }
 
+function updateButtons() {
+  startBtn.disabled = isWaiting || isConnected;
+  nextBtn.disabled = !isConnected;
+  endBtn.disabled = !isConnected;
+  disconnectBtn.disabled = false;
+}
+
 function start() {
   if (isWaiting || isConnected) return;
+  updateStatus("Requesting camera/microphone access...");
   navigator.mediaDevices.getUserMedia({audio:true, video:true})
     .then(stream => {
       localStream = stream;
       yourVideo.srcObject = stream;
       pc = new RTCPeerConnection(servers);
+      pc.onconnectionstatechange = () => {
+        console.log('Connection state:', pc.connectionState);
+        if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
+          updateStatus("Connection failed. Try again.");
+          end();
+        } else if (pc.connectionState === 'connected') {
+          updateStatus("Connected");
+        }
+      };
       localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
       pc.onicecandidate = (event => event.candidate ? sendMessage(JSON.stringify({'ice': event.candidate})) : console.log("Sent All Ice"));
       pc.ontrack = (event) => {
@@ -113,46 +139,79 @@ function start() {
       isWaiting = true;
       updateButtons();
       updateStatus("Searching for pair...");
-      // Add to queue
+      // Add to queue with onDisconnect
       var queueItem = queueRef.push();
-      queueItem.set(yourId);
-      // Listen for pairing
-      queueRef.on('value', handleQueue);
+      queueItem.set({id: yourId, timestamp: Date.now()});
+      queueItem.onDisconnect().remove();
+      // Attach queue listener if not already
+      if (!queueListenerAttached) {
+        queueRef.on('value', handleQueue);
+        queueListenerAttached = true;
+      }
+      // Set timeout for no pair
+      pairingTimeout = setTimeout(() => {
+        if (isWaiting) {
+          updateStatus("No pair found. Try again.");
+          end();
+        }
+      }, 30000);
     })
-    .catch(error => console.error('Error accessing media devices.', error));
+    .catch(error => {
+      console.error('Error accessing media devices.', error);
+      updateStatus("Error accessing camera/microphone. Check permissions.");
+    });
 }
 
 function handleQueue(snapshot) {
+  if (!isWaiting || currentPairId) return;
   var queue = snapshot.val();
-  if (!queue || !isWaiting || currentPairId) return;
-  var keys = Object.keys(queue);
-  if (keys.length >= 2) {
-    var key1 = keys[0];
-    var key2 = keys[1];
-    var id1 = queue[key1];
-    var id2 = queue[key2];
-    if (id1 == yourId || id2 == yourId) {
-      currentPairId = id1 < id2 ? id1 + '_' + id2 : id2 + '_' + id1;
-      pairRef.child(currentPairId).set({user1: id1, user2: id2});
-      queueRef.child(key1).remove();
-      queueRef.child(key2).remove();
-      // Stop listening to queue
-      queueRef.off('value', handleQueue);
-      updateStatus("Paired! Connecting...");
-      // Start signaling
-      startSignaling();
+  if (!queue) return;
+  var entries = Object.entries(queue).sort((a,b) => a[1].timestamp - b[1].timestamp);
+  if (entries.length >= 2) {
+    var [key1, data1] = entries[0];
+    var [key2, data2] = entries[1];
+    if (data1.id == yourId || data2.id == yourId) {
+      // Attempt atomic removal
+      queueRef.transaction((current) => {
+        if (!current) return;
+        var currEntries = Object.entries(current).sort((a,b) => a[1].timestamp - b[1].timestamp);
+        if (currEntries.length >= 2 && currEntries[0][1].id == data1.id && currEntries[1][1].id == data2.id) {
+          var newQueue = {...current};
+          delete newQueue[key1];
+          delete newQueue[key2];
+          return newQueue;
+        }
+        return; // abort
+      }, (error, committed) => {
+        if (committed) {
+          currentPairId = data1.id < data2.id ? data1.id + '_' + data2.id : data2.id + '_' + data1.id;
+          pairRef.child(currentPairId).set({user1: data1.id, user2: data2.id, timestamp: Date.now()});
+          clearTimeout(pairingTimeout);
+          updateStatus("Paired! Connecting...");
+          startSignaling();
+        }
+      });
     }
   }
 }
 
 function startSignaling() {
+  if (signalListenerAttached) {
+    signalsRef.child(currentPairId).off('child_added', readMessage);
+  }
   signalsRef.child(currentPairId).on('child_added', readMessage);
+  signalListenerAttached = true;
   // Determine who initiates
   var ids = currentPairId.split('_');
   if (yourId == ids[0]) {
     pc.createOffer()
       .then(offer => pc.setLocalDescription(offer))
-      .then(() => sendMessage(JSON.stringify({'sdp': pc.localDescription})));
+      .then(() => sendMessage(JSON.stringify({'sdp': pc.localDescription})))
+      .catch(error => {
+        console.error('Error creating offer:', error);
+        updateStatus("Error establishing connection.");
+        end();
+      });
   }
 }
 
@@ -166,50 +225,81 @@ function readMessage(data) {
   var msg = JSON.parse(data.val().message);
   var sender = data.val().sender;
   if (sender != yourId) {
-    if (msg.ice != undefined)
-      pc.addIceCandidate(new RTCIceCandidate(msg.ice));
-    else if (msg.sdp.type == "offer")
+    if (msg.ice != undefined) {
+      pc.addIceCandidate(new RTCIceCandidate(msg.ice))
+        .catch(error => console.error('Error adding ICE candidate:', error));
+    } else if (msg.sdp.type == "offer") {
       pc.setRemoteDescription(new RTCSessionDescription(msg.sdp))
         .then(() => pc.createAnswer())
         .then(answer => pc.setLocalDescription(answer))
-        .then(() => sendMessage(JSON.stringify({'sdp': pc.localDescription})));
-    else if (msg.sdp.type == "answer")
-      pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
+        .then(() => sendMessage(JSON.stringify({'sdp': pc.localDescription})))
+        .catch(error => {
+          console.error('Error handling offer:', error);
+          updateStatus("Error establishing connection.");
+          end();
+        });
+    } else if (msg.sdp.type == "answer") {
+      pc.setRemoteDescription(new RTCSessionDescription(msg.sdp))
+        .catch(error => {
+          console.error('Error setting remote description:', error);
+          updateStatus("Error establishing connection.");
+          end();
+        });
+    }
   }
 }
 
 function next() {
   if (!isConnected) return;
+  clearTimeout(pairingTimeout);
   // Close current connection
-  var oldPairId = currentPairId;
-  pc.close();
-  pc = null;
+  if (pc) {
+    pc.close();
+    pc = null;
+  }
   friendsVideo.srcObject = null;
   isConnected = false;
+  var oldPairId = currentPairId;
   currentPairId = null;
-  if (oldPairId) signalsRef.child(oldPairId).off('child_added', readMessage);
+  if (oldPairId && signalListenerAttached) {
+    signalsRef.child(oldPairId).off('child_added', readMessage);
+    signalListenerAttached = false;
+    // Delete signals
+    signalsRef.child(oldPairId).remove();
+  }
   updateStatus("Pair ended. Searching for new pair...");
   // Re-enter queue
   start();
 }
 
 function end() {
-  if (!isConnected) return;
-  var oldPairId = currentPairId;
-  pc.close();
-  pc = null;
+  if (!isConnected && !isWaiting) return;
+  clearTimeout(pairingTimeout);
+  if (pc) {
+    pc.close();
+    pc = null;
+  }
   friendsVideo.srcObject = null;
   isConnected = false;
+  var oldPairId = currentPairId;
   currentPairId = null;
-  if (oldPairId) signalsRef.child(oldPairId).off('child_added', readMessage);
+  if (oldPairId && signalListenerAttached) {
+    signalsRef.child(oldPairId).off('child_added', readMessage);
+    signalListenerAttached = false;
+    signalsRef.child(oldPairId).remove();
+  }
   // Stop listening to queue
-  queueRef.off('value', handleQueue);
+  if (queueListenerAttached) {
+    queueRef.off('value', handleQueue);
+    queueListenerAttached = false;
+  }
   isWaiting = false;
   updateButtons();
   updateStatus("Pair ended");
 }
 
 function disconnect() {
+  clearTimeout(pairingTimeout);
   if (localStream) {
     localStream.getTracks().forEach(track => track.stop());
     localStream = null;
@@ -224,13 +314,20 @@ function disconnect() {
   isWaiting = false;
   var oldPairId = currentPairId;
   currentPairId = null;
-  if (oldPairId) signalsRef.child(oldPairId).off('child_added', readMessage);
+  if (oldPairId && signalListenerAttached) {
+    signalsRef.child(oldPairId).off('child_added', readMessage);
+    signalListenerAttached = false;
+    signalsRef.child(oldPairId).remove();
+  }
   // Stop listening to queue
-  queueRef.off('value', handleQueue);
+  if (queueListenerAttached) {
+    queueRef.off('value', handleQueue);
+    queueListenerAttached = false;
+  }
   // Remove from queue
   queueRef.once('value', (snapshot) => {
     snapshot.forEach(child => {
-      if (child.val() == yourId) child.ref.remove();
+      if (child.val().id == yourId) child.ref.remove();
     });
   });
   updateButtons();
